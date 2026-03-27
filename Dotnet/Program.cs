@@ -1,16 +1,15 @@
-// Copyright(c) 2019-2025 pypy, Natsumi and individual contributors.
-// All rights reserved.
-//
-// This work is licensed under the terms of the MIT license.
-// For a copy, see <https://opensource.org/licenses/MIT>.
-
 using NLog;
 using NLog.Targets;
 using System;
 using System.Data.SQLite;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
+#if !LINUX
 using System.Windows.Forms;
+using VRCX.Overlay;
+#endif
 
 namespace VRCX
 {
@@ -22,9 +21,6 @@ namespace VRCX
         public static string Version { get; private set; }
         public static bool LaunchDebug;
         private static readonly Logger logger = LogManager.GetCurrentClassLogger();
-#if !LINUX
-        public static VRCXVRInterface VRCXVRInstance { get; private set; }
-#endif
         public static AppApi AppApiInstance { get; private set; }
 
         private static void SetProgramDirectories()
@@ -69,39 +65,45 @@ namespace VRCX
 
         private static void GetVersion()
         {
-            var buildName = "VRCX";
-            
             try
             {
-                Version = $"{buildName} {File.ReadAllText(Path.Join(BaseDirectory, "Version"))}";
-            }
-            catch (Exception)
-            {
-                Version = $"{buildName} Build";
-            }
+                var versionFile = File.ReadAllText(Path.Join(BaseDirectory, "Version")).Trim();
 
-            Version = Version.Replace("\r", "").Replace("\n", "");
+                // look for trailing git hash "-22bcd96" to indicate nightly build
+                var version = versionFile.Split('-');
+                if (version.Length > 0 && version[^1].Length == 7)
+                    Version = $"VRCX Nightly {versionFile}";
+                else
+                    Version = $"VRCX {versionFile}";
+            }
+            catch (Exception ex)
+            {
+                logger.Error(ex, "Failed to read version file");
+                Version = "VRCX Nightly Build";
+            }
         }
 
         private static void ConfigureLogger()
         {
+            var fileName = Path.Join(AppDataDirectory, "logs", "VRCX.log");
+            if (StartupArgs.LaunchArguments.IsOverlay)
+                fileName = Path.Join(AppDataDirectory, "logs", "VRCX.Overlay.log");
+
             LogManager.Setup().LoadConfiguration(builder =>
             {
                 var fileTarget = new FileTarget("fileTarget")
                 {
-                    FileName = Path.Join(AppDataDirectory, "logs", "VRCX.log"),
+                    FileName = fileName,
                     //Layout = "${longdate} [${level:uppercase=true}] ${logger} - ${message} ${exception:format=tostring}",
                     // Layout with padding between the level/logger and message so that the message always starts at the same column
                     Layout =
                         "${longdate} [${level:uppercase=true:padding=-5}] ${logger:padding=-20} - ${message} ${exception:format=tostring}",
-                    ArchiveFileName = Path.Join(AppDataDirectory, "logs", "VRCX.{#}.log"),
-                    ArchiveNumbering = ArchiveNumberingMode.DateAndSequence,
+                    ArchiveSuffixFormat = "{0:000}",
                     ArchiveEvery = FileArchivePeriod.Day,
                     MaxArchiveFiles = 4,
                     MaxArchiveDays = 7,
                     ArchiveAboveSize = 10000000,
                     ArchiveOldFileOnStartup = true,
-                    ConcurrentWrites = true,
                     KeepFileOpen = true,
                     AutoFlush = true,
                     Encoding = System.Text.Encoding.UTF8
@@ -113,14 +115,16 @@ namespace VRCX
                     Layout = "${longdate} [${level:uppercase=true:padding=-5}] ${logger:padding=-20} - ${message} ${exception:format=tostring}",
                     DetectConsoleAvailable = true
                 };
-                builder.ForLogger("VRCX").FilterMinLevel(LogLevel.Info).WriteTo(consoleTarget);
+                builder.ForLogger().FilterMinLevel(LogLevel.Debug).WriteTo(consoleTarget);
             });
         }
 
 #if !LINUX
         [STAThread]
+        [SuppressMessage("Interoperability", "CA1416:Validate platform compatibility")]
         private static void Main()
         {
+            BrowserSubprocess.Start();
             if (Wine.GetIfWine())
             {
                 MessageBox.Show(
@@ -145,7 +149,7 @@ namespace VRCX
                 {
                     case DialogResult.Yes:
                         logger.Fatal("Handled Exception, user selected auto install of vc_redist.");
-                        Update.DownloadInstallRedist();
+                        Update.DownloadInstallRedist().GetAwaiter().GetResult();
                         MessageBox.Show(
                             "vc_redist has finished installing, if the issue persists upon next restart, please reinstall VRCX From GitHub,\nVRCX Will now restart.",
                             "vc_redist installation complete", MessageBoxButtons.OK);
@@ -182,7 +186,7 @@ namespace VRCX
                     AppApiInstance.OpenLink("https://github.com/vrcx-team/VRCX/wiki#how-to-repair-vrcx-database");
                 }
             }
-
+            
             #endregion
 
             catch (Exception e)
@@ -199,69 +203,71 @@ namespace VRCX
                 }
 
                 logger.Fatal(e, "Unhandled Exception, program dying");
-                MessageBox.Show(e.ToString(), "PLEASE REPORT IN https://vrcx.app/discord", MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
+                var result = MessageBox.Show(e.ToString(), $"{Version} crashed, open Discord for support?", MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+                if (result == DialogResult.Yes)
+                {
+                    AppApiInstance.OpenLink("https://vrcx.app/discord");
+                }
                 Environment.Exit(0);
             }
         }
 
+        [SuppressMessage("Interoperability", "CA1416:Validate platform compatibility")]
         private static void Run()
         {
-            StartupArgs.ArgsCheck();
+            var args = Environment.GetCommandLineArgs();
+            StartupArgs.ArgsCheck(args);
             SetProgramDirectories();
             VRCXStorage.Instance.Load();
-            BrowserSubprocess.Start();
             ConfigureLogger();
             GetVersion();
+            if (StartupArgs.LaunchArguments.IsOverlay)
+                OverlayProgram.OverlayMain();
+
             Update.Check();
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
             logger.Info("{0} Starting...", Version);
+            logger.Info("Args: {0}", JsonSerializer.Serialize(StartupArgs.Args));
+            if (!string.IsNullOrEmpty(StartupArgs.LaunchArguments.LaunchCommand))
+                logger.Info("Launch Command: {0}", StartupArgs.LaunchArguments.LaunchCommand);
             logger.Debug("Wine detection: {0}", Wine.GetIfWine());
-
-            SQLiteLegacy.Instance.Init();
+            
+            IPCServer.Instance.Init();
+            SQLite.Instance.Init();
             AppApiInstance = new AppApiCef();
-
-            AppApiVr.Instance.Init();
+            
             ProcessMonitor.Instance.Init();
             Discord.Instance.Init();
-            WorldDBManager.Instance.Init();
             WebApi.Instance.Init();
             LogWatcher.Instance.Init();
             AutoAppLaunchManager.Instance.Init();
             CefService.Instance.Init();
-            IPCServer.Instance.Init();
-
-            if (VRCXStorage.Instance.Get("VRCX_DisableVrOverlayGpuAcceleration") == "true")
-                VRCXVRInstance = new VRCXVRLegacy();
-            else
-                VRCXVRInstance = new VRCXVR();
-            VRCXVRInstance.Init();
+            OverlayServer.Instance.Init();
 
             Application.Run(new MainForm());
+
             logger.Info("{0} Exiting...", Version);
             WebApi.Instance.SaveCookies();
-            VRCXVRInstance.Exit();
+            OverlayServer.Instance.Exit();
             CefService.Instance.Exit();
-
             AutoAppLaunchManager.Instance.Exit();
             LogWatcher.Instance.Exit();
             WebApi.Instance.Exit();
-            WorldDBManager.Instance.Stop();
-
             Discord.Instance.Exit();
-            SystemMonitor.Instance.Exit();
             VRCXStorage.Instance.Save();
-            SQLiteLegacy.Instance.Exit();
+            SQLite.Instance.Exit();
             ProcessMonitor.Instance.Exit();
         }
 #else
-        public static void PreInit(string version)
+        public static VRCXVRInterface VRCXVRInstance;
+        
+        public static void PreInit(string version, string[] args)
         {
             Version = version;
-            StartupArgs.ArgsCheck();
+            StartupArgs.ArgsCheck(args);
             SetProgramDirectories();
         }
 
@@ -271,9 +277,14 @@ namespace VRCX
             Update.Check();
 
             logger.Info("{0} Starting...", Version);
+            logger.Info("Args: {0}", JsonSerializer.Serialize(StartupArgs.Args));
+            if (!string.IsNullOrEmpty(StartupArgs.LaunchArguments.LaunchCommand))
+                logger.Info("Launch Command: {0}", StartupArgs.LaunchArguments.LaunchCommand);
 
             AppApiInstance = new AppApiElectron();
-            // ProcessMonitor.Instance.Init();
+            
+            VRCXVRInstance = new VRCXVRElectron();
+            VRCXVRInstance.Init();
         }
 #endif
     }
@@ -281,9 +292,9 @@ namespace VRCX
 #if LINUX
     public class ProgramElectron
     {
-        public void PreInit(string version)
+        public void PreInit(string version, string[] args)
         {
-            Program.PreInit(version);
+            Program.PreInit(version, args);
         }
 
         public void Init()

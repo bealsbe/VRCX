@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 
 namespace VRCX
 {
@@ -12,64 +13,73 @@ namespace VRCX
         }
 
         /// <summary>
-        /// Checks if the VRChat game and SteamVR are currently running and updates the browser's JavaScript function $app.updateIsGameRunning with the results.
+        /// for Cef only, checks if VRChat and SteamVR are currently running and updates the browser using JavaScript with the results.
         /// </summary>
         public override void CheckGameRunning()
         {
-            var isGameRunning = false;
-            var isSteamVRRunning = false;
-
-            if (ProcessMonitor.Instance.IsProcessRunning("VRChat"))
-            {
-                isGameRunning = true;
-            }
-            if (ProcessMonitor.Instance.IsProcessRunning("vrserver"))
-            {
-                isSteamVRRunning = true;
-            }
         }
 
         public override bool IsGameRunning()
         {
-            var isGameRunning = false;
-            var processes = Process.GetProcesses();
+            var processes = Process.GetProcessesByName("VRChat.exe");
+            var isGameRunning = processes.Length > 0;
             foreach (var process in processes)
-            {
-                if (process.ProcessName == "VRChat.exe")
-                {
-                    isGameRunning = true;
-                    break;
-                }
-            }
+                process.Dispose();
+
             return isGameRunning;
         }
 
         public override bool IsSteamVRRunning()
         {
-            var isSteamVRRunning = false;
-            var processes = Process.GetProcesses();
-            foreach (var process in processes)
+            var processNames = new[] { "vrmonitor", "monado-service" };
+            foreach (var name in processNames)
             {
-                if (process.ProcessName == "vrmonitor" || process.ProcessName == "monado-service")
-                {
-                    isSteamVRRunning = true;
-                    break;
-                }
+                var processes = Process.GetProcessesByName(name);
+                var isSteamVRRunning = processes.Length > 0;
+                foreach (var process in processes)
+                    process.Dispose();
+
+                if (isSteamVRRunning)
+                    return true;
             }
-            return isSteamVRRunning;
+            
+            // Check for wivrn-server (requires full scan)
+            var allProcesses = Process.GetProcesses();
+            var isRunning = allProcesses.Any(process => process.ProcessName.EndsWith("wivrn-server"));
+            foreach (var process in allProcesses)
+                process.Dispose();
+
+            return isRunning;
         }
 
         public override int QuitGame()
         {
-            var processes = Process.GetProcessesByName("vrchat");
+            var processes = Process.GetProcessesByName("VRChat.exe");
             if (processes.Length == 1)
                 processes[0].Kill();
+            foreach (var process in processes)
+                process.Dispose();
 
             return processes.Length;
         }
 
         public override bool StartGame(string arguments)
         {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "steam",
+                    Arguments = $"-applaunch 438100 {arguments}",
+                    UseShellExecute = false,
+                })?.Dispose();
+                return true; // Steam accepted launch command (no exception thrown)
+            }
+            catch (Exception e)
+            {
+                logger.Error($"Failed to start VRChat: {e.Message}, attempting to start via Steam path.");
+            }
+            
             try
             {
                 var steamPath = _steamPath;
@@ -91,7 +101,7 @@ namespace VRCX
                     FileName = steamExecutable,
                     Arguments = $"-applaunch 438100 {arguments}",
                     UseShellExecute = false,
-                })?.Close();
+                })?.Dispose();
 
                 return true;
             }
@@ -104,20 +114,8 @@ namespace VRCX
 
         public override bool StartGameFromPath(string path, string arguments)
         {
-            if (!path.EndsWith(".exe"))
-                path = Path.Join(path, "launch.exe");
-
-            if (!path.EndsWith("launch.exe") || !File.Exists(path))
-                return false;
-
-            Process.Start(new ProcessStartInfo
-            {
-                WorkingDirectory = Path.GetDirectoryName(path),
-                FileName = path,
-                UseShellExecute = false,
-                Arguments = arguments
-            })?.Close();
-            return true;
+            // This method is not used
+            return false;
         }
     }
 }

@@ -1,9 +1,3 @@
-// Copyright(c) 2019-2025 pypy, Natsumi and individual contributors.
-// All rights reserved.
-//
-// This work is licensed under the terms of the MIT license.
-// For a copy, see <https://opensource.org/licenses/MIT>.
-
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -11,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using NLog;
 
@@ -33,10 +28,13 @@ namespace VRCX
         private ReaderWriterLockSlim m_LogListLock;
         private bool m_FirstRun = true;
         private bool m_ResetLog;
-        private Thread m_Thread;
-        private DateTime tillDate = DateTime.UtcNow;
+        private bool threadActive;
+        private Thread? m_Thread;
+        private DateTime tillDate;
         public bool VrcClosedGracefully;
         private readonly ConcurrentQueue<string> m_LogQueue = new ConcurrentQueue<string>(); // for electron
+        private static readonly Regex CleanId = new("[^a-zA-Z0-9_\\-~:()]", RegexOptions.Compiled);
+        private static readonly Regex CleanLocation = new("[/]", RegexOptions.Compiled);
 
         // NOTE
         // FileSystemWatcher() is unreliable
@@ -62,6 +60,7 @@ namespace VRCX
 
         public void Exit()
         {
+            threadActive = false;
             var thread = m_Thread;
             m_Thread = null;
             thread.Interrupt();
@@ -77,6 +76,7 @@ namespace VRCX
         public void SetDateTill(string date)
         {
             tillDate = DateTime.Parse(date, CultureInfo.InvariantCulture, DateTimeStyles.None).ToUniversalTime();
+            threadActive = true;
             logger.Info("SetDateTill: {0}", tillDate.ToLocalTime());
         }
 
@@ -84,7 +84,8 @@ namespace VRCX
         {
             while (m_Thread != null)
             {
-                Update();
+                if (threadActive)
+                    Update();
 
                 try
                 {
@@ -130,15 +131,11 @@ namespace VRCX
                 foreach (var fileInfo in fileInfos)
                 {
                     fileInfo.Refresh();
-                    if (fileInfo.Exists == false)
-                    {
+                    if (!fileInfo.Exists)
                         continue;
-                    }
 
                     if (DateTime.Compare(fileInfo.LastWriteTimeUtc, tillDate) < 0)
-                    {
                         continue;
-                    }
 
                     if (m_LogContextMap.TryGetValue(fileInfo.Name, out var logContext))
                     {
@@ -151,9 +148,7 @@ namespace VRCX
                     }
 
                     if (logContext.Length == fileInfo.Length)
-                    {
                         continue;
-                    }
 
                     logContext.Length = fileInfo.Length;
                     ParseLog(fileInfo, logContext);
@@ -274,7 +269,8 @@ namespace VRCX
                             ParseApplicationQuit(fileInfo, logContext, line, offset) ||
                             ParseOpenVRInit(fileInfo, logContext, line, offset) ||
                             ParseDesktopMode(fileInfo, logContext, line, offset) ||
-                            ParseOscFailedToStart(fileInfo, logContext, line, offset))
+                            ParseOscFailedToStart(fileInfo, logContext, line, offset) ||
+                            ParseUntrustedUrl(fileInfo, logContext, line, offset))
                         {
                         }
                     }
@@ -298,7 +294,7 @@ namespace VRCX
                     m_LogQueue.Enqueue(logLine);
 #else
                     if (MainForm.Instance != null && MainForm.Instance.Browser != null)
-                        MainForm.Instance.Browser.ExecuteScriptAsync("$app.addGameLogEvent", logLine);
+                        MainForm.Instance.Browser.ExecuteScriptAsync("window?.$pinia?.gameLog.addGameLogEvent", logLine);
 #endif
                 }
 
@@ -360,7 +356,7 @@ namespace VRCX
                 if (lineOffset < 0)
                     return true;
                 lineOffset += 17;
-                if (lineOffset >= line.Length)
+                if (lineOffset > line.Length)
                     return true;
 
                 var worldName = line.Substring(lineOffset);
@@ -378,6 +374,7 @@ namespace VRCX
                     return true;
 
                 var location = line.Substring(lineOffset);
+                location = CleanLocation.Replace(location, string.Empty);
 
                 AppendLog(new[]
                 {
@@ -391,8 +388,7 @@ namespace VRCX
                 // logContext.onJoinPhotonDisplayName = string.Empty;
                 // logContext.onJoinPhotonDisplayNameDate = string.Empty;
                 logContext.LastAudioDevice = string.Empty;
-                logContext.LastVideoError = string.Empty;
-                logContext.locationDestination = string.Empty;
+                logContext.VideoPlaybackErrors.Clear();
                 VrcClosedGracefully = false;
 
                 return true;
@@ -429,18 +425,19 @@ namespace VRCX
             // 2021.09.02 00:49:15 Log        -  [Behaviour] Destination fetching: wrld_4432ea9b-729c-46e3-8eaf-846aa0a37fdd
             // 2022.08.13 18:57:00 Log        -  [Behaviour] OnLeftRoom
             // 2024.11.22 15:32:28 Log        -  [Behaviour] Successfully left room
+            // 2025.11.20 01:35:38 Debug      -  [Behaviour] OnLeftRoom
 
-            if (line.Contains("[Behaviour] Successfully left room"))
+            if (line.Contains("[Behaviour] OnLeftRoom"))
             {
                 AppendLog(new[]
                 {
                     fileInfo.Name,
                     ConvertLogTimeToISO8601(line),
                     "location-destination",
-                    logContext.locationDestination
+                    logContext.LocationDestination
                 });
 
-                logContext.locationDestination = string.Empty;
+                logContext.LocationDestination = string.Empty;
 
                 return true;
             }
@@ -454,7 +451,8 @@ namespace VRCX
                 if (lineOffset >= line.Length)
                     return true;
 
-                logContext.locationDestination = line.Substring(lineOffset);
+                var locationDestination = line.Substring(lineOffset);
+                logContext.LocationDestination = CleanLocation.Replace(locationDestination, string.Empty);
 
                 return true;
             }
@@ -491,6 +489,11 @@ namespace VRCX
                     return true;
 
                 var userInfo = ParseUserInfo(line.Substring(lineOffset));
+                if (string.IsNullOrEmpty(userInfo.DisplayName) && string.IsNullOrEmpty(userInfo.UserId))
+                {
+                    logger.Warn("Failed to parse user info from log line: {0}", line);
+                    return true;
+                }
 
                 AppendLog(new[]
                 {
@@ -514,14 +517,19 @@ namespace VRCX
                     return true;
 
                 var userInfo = ParseUserInfo(line.Substring(lineOffset));
+                if (string.IsNullOrEmpty(userInfo.DisplayName) && string.IsNullOrEmpty(userInfo.UserId))
+                {
+                    logger.Warn("Failed to parse user info from log line: {0}", line);
+                    return true;
+                }
 
                 AppendLog(new[]
                 {
                     fileInfo.Name,
                     ConvertLogTimeToISO8601(line),
                     "player-left",
-                    userInfo.DisplayName,
-                    userInfo.UserId
+                    userInfo.DisplayName ?? string.Empty,
+                    userInfo.UserId ?? string.Empty
                 });
 
                 return true;
@@ -622,12 +630,18 @@ namespace VRCX
             // 2024.07.31 22:28:47 Error      -  [AVProVideo] Error: Loading failed.  File not found, codec not supported, video resolution too high or insufficient system resources.
             // 2024.07.31 23:04:15 Error      -  [AVProVideo] Error: Loading failed.  File not found, codec not supported, video resolution too high or insufficient system resources.
 
+            // 2025.05.04 22:38:12 Error      -  Attempted to play an untrusted URL (Domain: localhost) that is not allowlisted for public instances. If this URL is needed for the world to work, the domain needs to be added to the world's Video Player Allowed Domains list on the website.
+            const string youtubeBotError = "Sign in to confirm";
+            const string youtubeBotErrorFixUrl = "[VRCX] Fix error with this: https://github.com/EllyVR/VRCVideoCacher";
+
             if (line.Contains("[Video Playback] ERROR: "))
             {
                 var data = line.Substring(offset + 24);
-                if (data == logContext.LastVideoError)
+                if (!logContext.VideoPlaybackErrors.Add(data))
                     return true;
-                logContext.LastVideoError = data;
+
+                if (data.Contains(youtubeBotError))
+                    data = $"{youtubeBotErrorFixUrl}\n{data}";
 
                 AppendLog(new[]
                 {
@@ -643,9 +657,35 @@ namespace VRCX
             if (line.Contains("[AVProVideo] Error: "))
             {
                 var data = line.Substring(offset + 20);
-                if (data == logContext.LastVideoError)
+                if (!logContext.VideoPlaybackErrors.Add(data))
                     return true;
-                logContext.LastVideoError = data;
+
+                if (data.Contains(youtubeBotError))
+                    data = $"{youtubeBotErrorFixUrl}\n{data}";
+
+                AppendLog(new[]
+                {
+                    fileInfo.Name,
+                    ConvertLogTimeToISO8601(line),
+                    "event",
+                    "VideoError: " + data
+                });
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool ParseUntrustedUrl(FileInfo fileInfo, LogContext logContext, string line, int offset)
+        {
+            // 2025.05.04 22:38:12 Error      -  Attempted to play an untrusted URL (Domain: localhost) that is not allowlisted for public instances. If this URL is needed for the world to work, the domain needs to be added to the world's Video Player Allowed Domains list on the website.
+
+            if (line.Contains("Attempted to play an untrusted URL"))
+            {
+                var data = line.Substring(offset);
+                if (!logContext.VideoPlaybackErrors.Add(data))
+                    return true;
 
                 AppendLog(new[]
                 {
@@ -690,9 +730,8 @@ namespace VRCX
 
             var data = line.Substring(offset + 13);
 
-#if !LINUX
-            WorldDBManager.Instance.ProcessLogWorldDataRequest(data);
-#endif
+            // PWI, deprecated
+            logger.Info("VRCX-World data: {0}", data);
             return true;
         }
 
@@ -1301,16 +1340,23 @@ namespace VRCX
 
         private bool ParseStickerSpawn(FileInfo fileInfo, LogContext logContext, string line, int offset)
         {
+            // [StickersManager] User usr_032383a7-748c-4fb2-94e4-bcb928e5de6b (Natsumi-sama) spawned sticker inv_8b380ee4-9a8a-484e-a0c3-b01290b92c6a
             var index = line.IndexOf("[StickersManager] User ", StringComparison.Ordinal);
-            if (index == -1 || !line.Contains("file_") || !line.Contains("spawned sticker"))
+            if (index == -1 || !line.Contains("inv_") || !line.Contains("spawned sticker"))
                 return false;
 
-            string info = line.Substring(index + 23);
+            var info = line.Substring(index + 23);
 
-            var (userId, displayName) = ParseUserInfo(info);
+            var (userId, displayName) = ParseUserInfo(info); // it's flipped
+            if (string.IsNullOrEmpty(displayName) && string.IsNullOrEmpty(userId))
+            {
+                logger.Warn("Failed to parse user info from log line: {0}", line);
+                return true;
+            }
 
-            var fileIdIndex = info.IndexOf("file_", StringComparison.Ordinal);
-            string fileId = info.Substring(fileIdIndex);
+            var inventoryIdIndex = info.IndexOf("inv_", StringComparison.Ordinal);
+            var inventoryId = info.Substring(inventoryIdIndex);
+            inventoryId = CleanId.Replace(inventoryId, string.Empty);
 
             AppendLog(new[]
             {
@@ -1319,7 +1365,7 @@ namespace VRCX
                 "sticker-spawn",
                 userId,
                 displayName,
-                fileId,
+                inventoryId
             });
 
             return true;
@@ -1365,16 +1411,17 @@ namespace VRCX
             string userDisplayName;
             string userId;
 
-            int pos = userInfo.LastIndexOf(" (", StringComparison.Ordinal);
+            var pos = userInfo.LastIndexOf(" (", StringComparison.Ordinal);
             if (pos >= 0)
             {
                 userDisplayName = userInfo.Substring(0, pos);
                 userId = userInfo.Substring(pos + 2, userInfo.LastIndexOf(')') - (pos + 2));
+                userId = CleanId.Replace(userId, string.Empty);
             }
             else
             {
                 userDisplayName = userInfo;
-                userId = null;
+                userId = string.Empty;
             }
 
             return (userDisplayName, userId);
@@ -1384,9 +1431,9 @@ namespace VRCX
         {
             public bool AudioDeviceChanged;
             public string LastAudioDevice;
-            public string LastVideoError;
+            public readonly HashSet<string> VideoPlaybackErrors = new(50);
             public long Length;
-            public string locationDestination;
+            public string LocationDestination;
             public long Position;
             public string RecentWorldName;
             public bool ShaderKeywordsLimitReached;

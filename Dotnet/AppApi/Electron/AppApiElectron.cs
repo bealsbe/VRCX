@@ -9,31 +9,20 @@ namespace VRCX
     public partial class AppApiElectron : AppApi
     {
         private static readonly Logger logger = LogManager.GetCurrentClassLogger();
-        
-        public override void DeleteAllCookies()
-        {
-        }
-        
+
         public override void ShowDevTools()
         {
         }
-        
+
         public override void SetVR(bool active, bool hmdOverlay, bool wristOverlay, bool menuButton, int overlayHand)
         {
-        }
-        
-        public override void RefreshVR()
-        {
-        }
-
-        public override void RestartVR()
-        {
+            Program.VRCXVRInstance.SetActive(active, hmdOverlay, wristOverlay, menuButton, overlayHand);
         }
 
         public override void SetZoom(double zoomLevel)
         {
         }
-        
+
         public override async Task<double> GetZoom()
         {
             return 1;
@@ -51,28 +40,16 @@ namespace VRCX
         {
             return false;
         }
-        
-        public override void ExecuteAppFunction(string function, string json)
-        {
-        }
-
-        public override void ExecuteVrFeedFunction(string function, string json)
-        {
-        }
 
         public override void ExecuteVrOverlayFunction(string function, string json)
         {
+            Program.VRCXVRInstance.ExecuteVrOverlayFunction(function, json);
         }
-        
-        public override string GetLaunchCommand()
-        {
-            return string.Empty;
-        }
-        
+
         public override void FocusWindow()
         {
         }
-        
+
         public override void ChangeTheme(int value)
         {
         }
@@ -80,7 +57,7 @@ namespace VRCX
         public override void DoFunny()
         {
         }
-        
+
         public override string GetClipboard()
         {
             var process = new Process
@@ -111,7 +88,7 @@ namespace VRCX
         public override void SetStartup(bool enabled)
         {
         }
-        
+
         public override void CopyImageToClipboard(string path)
         {
             if (!File.Exists(path) ||
@@ -122,7 +99,7 @@ namespace VRCX
                  !path.EndsWith(".bmp") &&
                  !path.EndsWith(".webp")))
                 return;
-        
+
             var process = new Process
             {
                 StartInfo = new ProcessStartInfo
@@ -133,7 +110,7 @@ namespace VRCX
                     CreateNoWindow = true
                 }
             };
-            try 
+            try
             {
                 process.Start();
                 process.WaitForExit();
@@ -147,16 +124,17 @@ namespace VRCX
         public override void FlashWindow()
         {
         }
-        
+
         public override void SetUserAgent()
         {
         }
-        
-        public override bool IsRunningUnderWine()
+
+        public override void SetTrayIconNotification(bool notify)
         {
-            return false;
         }
-        
-        
+
+        public override void OpenCalendarFile(string icsContent)
+        {
+        }
     }
 }

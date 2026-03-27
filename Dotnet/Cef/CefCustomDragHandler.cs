@@ -25,8 +25,9 @@ namespace VRCX
                     return true;
                 }
 
-                // forgive me father for i have sinned once again
-                Program.AppApiInstance.ExecuteAppFunction("dragEnterCef", file);
+                if (MainForm.Instance?.Browser != null && !MainForm.Instance.Browser.IsLoading && MainForm.Instance.Browser.CanExecuteJavascriptInMainFrame)
+                    MainForm.Instance.Browser.ExecuteScriptAsync("window?.$pinia?.vrcx.dragEnterCef", file);
+
                 dragData.Dispose();
                 return false;
             }

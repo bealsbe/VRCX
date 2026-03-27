@@ -4,74 +4,172 @@ const {
     BrowserWindow,
     ipcMain,
     app,
+    clipboard,
     Tray,
     Menu,
     dialog,
-    Notification
+    Notification,
+    nativeImage
 } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 
-if (!isDotNetInstalled()) {
-    dialog.showErrorBox(
-        'VRCX',
-        'Please install .NET 9.0 Runtime "dotnet-runtime-9.0" to run VRCX.'
-    );
-    app.quit();
-    return;
+//app.disableHardwareAcceleration();
+
+const bundledDotNetPath = path.join(process.resourcesPath, 'dotnet-runtime');
+if (fs.existsSync(bundledDotNetPath)) {
+    // Include bundled .NET runtime
+    process.env.DOTNET_ROOT = bundledDotNetPath;
+    process.env.PATH = `${bundledDotNetPath}:${process.env.PATH}`;
+} else if (process.platform === 'darwin') {
+    const dotnetPath = path.join('/usr/local/share/dotnet');
+    const dotnetPathArm = path.join('/usr/local/share/dotnet/x64');
+    if (fs.existsSync(dotnetPathArm)) {
+        process.env.DOTNET_ROOT = dotnetPathArm;
+        process.env.PATH = `${dotnetPathArm}:${process.env.PATH}`;
+    } else if (fs.existsSync(dotnetPath)) {
+        process.env.DOTNET_ROOT = dotnetPath;
+        process.env.PATH = `${dotnetPath}:${process.env.PATH}`;
+    }
 }
 
-// get launch arguments
-const args = process.argv.slice(1);
-const noInstall = args.some((val) => val === '--no-install');
-const x11 = args.some((val) => val === '--x11');
-const homePath = getHomePath();
-tryCopyFromWinePrefix();
+if (!isDotNetInstalled()) {
+    app.whenReady().then(() => {
+        dialog.showErrorBox(
+            'VRCX',
+            'Please install .NET 9.0 Runtime "dotnet-runtime-9.0" to run VRCX.'
+        );
+        app.quit();
+    });
+}
 
+const VRCX_URI_PREFIX = 'vrcx';
+let isOverlayActive = false;
+let appIsQuitting = false;
 const rootDir = app.getAppPath();
-require(path.join(rootDir, 'build/Electron/VRCX-Electron.cjs'));
+
+// Get launch arguments
+let appImagePath = process.env.APPIMAGE;
+const args = process.argv.slice(1);
+const noInstall = args.includes('--no-install');
+const x11 = args.includes('--x11');
+const noDesktop = args.includes('--no-desktop');
+const startup = args.includes('--startup');
+const debug = args.includes('--hot-reload');
+const noUpdater =
+    args.includes('--no-updater') ||
+    fs.existsSync(path.join(rootDir, '.no-updater'));
+if (process.defaultApp && process.platform !== 'win32') {
+    if (process.argv.length >= 2) {
+        app.setAsDefaultProtocolClient(VRCX_URI_PREFIX, process.execPath, [
+            path.resolve(process.argv[1])
+        ]);
+    } else {
+        app.setAsDefaultProtocolClient(VRCX_URI_PREFIX);
+    }
+}
+
+const version = getVersion();
+const homePath = getHomePath();
+tryRelaunchWithArgs(args);
+tryCopyFromWinePrefix();
+const userDataPath = getElectronUserDataPath();
+console.log('Electron userData path:', userDataPath);
+if (!fs.existsSync(userDataPath)) {
+    fs.mkdirSync(userDataPath, { recursive: true });
+}
+app.setPath('userData', userDataPath);
+
+const armPath = path.join(rootDir, 'build/Electron/VRCX-Electron-arm64.cjs');
+if (process.arch === 'arm64' && fs.existsSync(armPath)) {
+    require(armPath);
+} else {
+    require(path.join(rootDir, 'build/Electron/VRCX-Electron.cjs'));
+}
 
 const InteropApi = require('./InteropApi');
 const interopApi = new InteropApi();
 
-const version = getVersion();
-interopApi.getDotNetObject('ProgramElectron').PreInit(version);
+const OVERLAY_WRIST_FRAME_WIDTH = 512;
+const OVERLAY_WRIST_FRAME_HEIGHT = 512;
+const OVERLAY_HMD_FRAME_WIDTH = 1024;
+const OVERLAY_HMD_FRAME_HEIGHT = 1024;
+const OVERLAY_SHARED_HEIGHT =
+    OVERLAY_WRIST_FRAME_HEIGHT + OVERLAY_HMD_FRAME_HEIGHT;
+const OVERLAY_SHARED_WIDTH = Math.max(
+    OVERLAY_WRIST_FRAME_WIDTH,
+    OVERLAY_HMD_FRAME_WIDTH
+);
+const OVERLAY_FRAME_SIZE = OVERLAY_SHARED_WIDTH * OVERLAY_SHARED_HEIGHT * 4;
+const OVERLAY_SHM_PATH = '/dev/shm/vrcx_overlay';
+
+function createOverlayWindowShm() {
+    fs.writeFileSync(OVERLAY_SHM_PATH, Buffer.alloc(OVERLAY_FRAME_SIZE + 1));
+}
+
+interopApi.getDotNetObject('ProgramElectron').PreInit(version, args);
 interopApi.getDotNetObject('VRCXStorage').Load();
 interopApi.getDotNetObject('ProgramElectron').Init();
-interopApi.getDotNetObject('SQLiteLegacy').Init();
+interopApi.getDotNetObject('SQLite').Init();
 interopApi.getDotNetObject('AppApiElectron').Init();
 interopApi.getDotNetObject('Discord').Init();
 interopApi.getDotNetObject('WebApi').Init();
 interopApi.getDotNetObject('LogWatcher').Init();
 
+interopApi.getDotNetObject('SystemMonitorElectron').Init();
+interopApi.getDotNetObject('AppApiVrElectron').Init();
+
 ipcMain.handle('callDotNetMethod', (event, className, methodName, args) => {
     return interopApi.callMethod(className, methodName, args);
 });
 
+/** @type {BrowserWindow} */
 let mainWindow = undefined;
 
 const VRCXStorage = interopApi.getDotNetObject('VRCXStorage');
-let isCloseToTray = VRCXStorage.Get('VRCX_CloseToTray') === 'true';
-let appImagePath = process.env.APPIMAGE;
+const hasAskedToMoveAppImage =
+    VRCXStorage.Get('VRCX_HasAskedToMoveAppImage') === 'true';
 
-ipcMain.handle('applyWindowSettings', (event, position, size, state) => {
-    if (position) {
-        mainWindow.setPosition(parseInt(position.x), parseInt(position.y));
+function getCloseToTray() {
+    if (process.platform === 'darwin') {
+        return true;
     }
-    if (size) {
-        mainWindow.setSize(parseInt(size.width), parseInt(size.height));
-    }
-    if (state) {
-        if (state === '0') {
-            mainWindow.restore();
-        } else if (state === '1') {
-            mainWindow.restore();
-        } else if (state === '2') {
-            mainWindow.maximize();
+    return VRCXStorage.Get('VRCX_CloseToTray') === 'true';
+}
+
+const gotTheLock = app.requestSingleInstanceLock();
+const strip_vrcx_prefix_regex = new RegExp('^' + VRCX_URI_PREFIX + '://');
+
+if (!gotTheLock) {
+    console.log('Another instance is already running. Exiting.');
+    app.quit();
+} else {
+    app.on('second-instance', (event, commandLine, workingDirectory) => {
+        if (mainWindow && commandLine.length >= 2) {
+            try {
+                mainWindow.webContents.send(
+                    'launch-command',
+                    commandLine
+                        .pop()
+                        .trim()
+                        .replace(strip_vrcx_prefix_regex, '')
+                );
+            } catch (err) {
+                console.error('Error processing second-instance command:', err);
+            }
         }
-    }
-});
+    });
+
+    app.on('open-url', (event, url) => {
+        if (mainWindow && url) {
+            mainWindow.webContents.send(
+                'launch-command',
+                url.replace(strip_vrcx_prefix_regex, '')
+            );
+        }
+    });
+}
 
 ipcMain.handle('dialog:openFile', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -107,10 +205,15 @@ ipcMain.handle('notification:showNotification', (event, title, body, icon) => {
 
 ipcMain.handle('app:restart', () => {
     if (process.platform === 'linux') {
-        const options = { args: process.argv.slice(1) };
+        const options = {
+            execPath: process.execPath,
+            args: process.argv.slice(1)
+        };
         if (appImagePath) {
             options.execPath = appImagePath;
-            options.args.unshift('--appimage-extract-and-run');
+            if (!x11 && !options.args.includes('--appimage-extract-and-run')) {
+                options.args.unshift('--appimage-extract-and-run');
+            }
         }
         app.relaunch(options);
         app.exit(0);
@@ -120,9 +223,54 @@ ipcMain.handle('app:restart', () => {
     }
 });
 
-function relaunchWithArgs(args) {
-    if (process.argv.includes('--ozone-platform-hint=auto')) {
-        console.log('Already running with correct arguments');
+ipcMain.handle('app:getOverlayWindow', () => {
+    if (overlayWindow && overlayWindow.webContents) {
+        return (
+            !overlayWindow.webContents.isLoading() &&
+            overlayWindow.webContents.isPainting()
+        );
+    }
+    return false;
+});
+
+ipcMain.handle(
+    'app:updateVr',
+    (event, active, hmdOverlay, wristOverlay, menuButton, overlayHand) => {
+        if (!active || (!hmdOverlay && !wristOverlay)) {
+            disposeOverlay();
+            return;
+        }
+        if (active && !overlayWindow) {
+            try {
+                createOverlayWindowOffscreen();
+            } catch (err) {
+                console.error('Error creating overlay windows:', err);
+            }
+        }
+    }
+);
+
+ipcMain.handle('app:getArch', () => {
+    return process.arch.toString();
+});
+ipcMain.handle('app:getClipboardText', () => {
+    return clipboard.readText();
+});
+
+ipcMain.handle('app:getNoUpdater', () => {
+    return noUpdater;
+});
+
+ipcMain.handle('app:setTrayIconNotification', (event, notify) => {
+    setTrayIconNotification(notify);
+});
+
+function tryRelaunchWithArgs(args) {
+    if (
+        process.platform !== 'linux' ||
+        x11 ||
+        args.includes('--ozone-platform-hint=auto')
+    ) {
         return;
     }
 
@@ -148,39 +296,34 @@ function relaunchWithArgs(args) {
 }
 
 function createWindow() {
-    if (
-        process.platform === 'linux' &&
-        !process.argv.includes('--ozone-platform-hint=auto') &&
-        !x11
-    ) {
-        relaunchWithArgs(process.argv.slice(1));
-    }
-
     app.commandLine.appendSwitch('enable-speech-dispatcher');
 
     const x = parseInt(VRCXStorage.Get('VRCX_LocationX')) || 0;
     const y = parseInt(VRCXStorage.Get('VRCX_LocationY')) || 0;
     const width = parseInt(VRCXStorage.Get('VRCX_SizeWidth')) || 1920;
     const height = parseInt(VRCXStorage.Get('VRCX_SizeHeight')) || 1080;
+    const zoomLevel = parseFloat(VRCXStorage.Get('VRCX_ZoomLevel')) || 0;
     mainWindow = new BrowserWindow({
         x,
         y,
         width,
         height,
-        icon: path.join(rootDir, 'VRCX.png'),
+        icon: path.join(rootDir, 'images/VRCX.png'),
         autoHideMenuBar: true,
+        titleBarStyle: 'hiddenInset',
         webPreferences: {
             preload: path.join(__dirname, 'preload.js')
-        },
-        webContents: {
-            userAgent: version
         }
     });
     applyWindowState();
     const indexPath = path.join(rootDir, 'build/html/index.html');
-    mainWindow.loadFile(indexPath, { userAgent: version });
+    mainWindow.loadFile(indexPath);
+    if (debug) {
+        mainWindow.loadURL('http://localhost:9000/index.html');
+        mainWindow.webContents.openDevTools();
+    }
 
-    // add proxy config
+    // add proxy config, doesn't work, thanks electron
     // const proxy = VRCXStorage.Get('VRCX_Proxy');
     // if (proxy) {
     //     session.setProxy(
@@ -197,29 +340,40 @@ function createWindow() {
     // Open the DevTools.
     // mainWindow.webContents.openDevTools()
 
+    mainWindow.webContents.on('did-finish-load', () => {
+        mainWindow.webContents.setZoomLevel(zoomLevel);
+    });
+
     mainWindow.webContents.on('before-input-event', (event, input) => {
         if (input.control && input.key === '=') {
             mainWindow.webContents.setZoomLevel(
                 mainWindow.webContents.getZoomLevel() + 1
             );
         }
+        if (input.control && input.key === '-') {
+            mainWindow.webContents.setZoomLevel(
+                mainWindow.webContents.getZoomLevel() - 1
+            );
+        }
     });
 
     mainWindow.webContents.on('zoom-changed', (event, zoomDirection) => {
-        const currentZoom = mainWindow.webContents.getZoomLevel();
+        let currentZoom = mainWindow.webContents.getZoomLevel();
         if (zoomDirection === 'in') {
-            mainWindow.webContents.setZoomLevel(currentZoom + 1);
+            mainWindow.webContents.setZoomLevel(++currentZoom);
         } else {
-            mainWindow.webContents.setZoomLevel(currentZoom - 1);
+            mainWindow.webContents.setZoomLevel(--currentZoom);
         }
+        VRCXStorage.Set('VRCX_ZoomLevel', currentZoom.toString());
     });
     mainWindow.webContents.setVisualZoomLevelLimits(1, 5);
 
     mainWindow.on('close', (event) => {
-        isCloseToTray = VRCXStorage.Get('VRCX_CloseToTray') === 'true';
-        if (isCloseToTray && !app.isQuitting) {
+        if (getCloseToTray() && !appIsQuitting) {
             event.preventDefault();
             mainWindow.hide();
+        } else {
+            app.quit();
         }
     });
 
@@ -252,34 +406,124 @@ function createWindow() {
     mainWindow.on('restore', () => {
         mainWindow.webContents.send('setWindowState', '0');
     });
+
+    mainWindow.on('focus', () => {
+        mainWindow.webContents.send('onBrowserFocus');
+    });
 }
 
+let overlayWindow = undefined;
+
+function createOverlayWindowOffscreen() {
+    if (process.platform !== 'linux') {
+        console.error('Offscreen overlay is only supported on Linux.');
+        return;
+    }
+    isOverlayActive = true;
+    if (!fs.existsSync(OVERLAY_SHM_PATH)) {
+        createOverlayWindowShm();
+    }
+
+    const x = parseInt(VRCXStorage.Get('VRCX_LocationX')) || 0;
+    const y = parseInt(VRCXStorage.Get('VRCX_LocationY')) || 0;
+    const width = OVERLAY_SHARED_WIDTH;
+    const height = OVERLAY_SHARED_HEIGHT;
+
+    overlayWindow = new BrowserWindow({
+        x,
+        y,
+        width,
+        height,
+        icon: path.join(rootDir, 'images/VRCX.png'),
+        autoHideMenuBar: true,
+        transparent: true,
+        frame: false,
+        show: false,
+        webPreferences: {
+            partition: 'vrcx-vr-overlay',
+            offscreen: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+    overlayWindow.webContents.setFrameRate(48);
+
+    let fileUrl = `file://${path.join(rootDir, 'build/html/vr.html')}`;
+    if (debug) {
+        fileUrl = 'http://localhost:9000/vr.html';
+    }
+    overlayWindow.loadURL(fileUrl, { userAgent: version });
+    // Use paint event for offscreen rendering
+    overlayWindow.webContents.on('paint', (event, dirty, image) => {
+        const buffer = image.toBitmap();
+        //console.log('Captured frame via paint event, size:', buffer.length);
+        writeOverlayFrame(buffer);
+    });
+}
+
+function writeOverlayFrame(imageBuffer) {
+    try {
+        const fd = fs.openSync(OVERLAY_SHM_PATH, 'r+');
+        const buffer = Buffer.alloc(OVERLAY_FRAME_SIZE + 1);
+        buffer[0] = 0; // not ready
+        imageBuffer.copy(buffer, 1, 0, OVERLAY_FRAME_SIZE);
+        buffer[0] = 1; // ready
+        fs.writeSync(fd, buffer);
+        fs.closeSync(fd);
+        //console.log('Wrote frame to shared memory');
+    } catch (err) {
+        console.error('Error writing frame to shared memory:', err);
+    }
+}
+
+let tray = null;
+let trayIcon = null;
+let trayIconNotify = null;
 function createTray() {
-    const tray = new Tray(path.join(rootDir, 'images/tray.png'));
+    if (process.platform === 'darwin') {
+        const image = nativeImage.createFromPath(
+            path.join(rootDir, 'images/VRCX.png')
+        );
+        trayIcon = image.resize({ width: 16, height: 16 });
+
+        const imageNotify = nativeImage.createFromPath(
+            path.join(rootDir, 'images/VRCX_notify.png')
+        );
+        trayIconNotify = imageNotify.resize({ width: 16, height: 16 });
+    } else if (process.platform === 'linux') {
+        const image = nativeImage.createFromPath(
+            path.join(rootDir, 'images/VRCX.png')
+        );
+        trayIcon = image.resize({ width: 64, height: 64 });
+
+        const imageNotify = nativeImage.createFromPath(
+            path.join(rootDir, 'images/VRCX_notify.png')
+        );
+        trayIconNotify = imageNotify.resize({ width: 64, height: 64 });
+    } else {
+        trayIcon = path.join(rootDir, 'images/VRCX.ico');
+        trayIconNotify = path.join(rootDir, 'images/VRCX_notify.ico');
+    }
+    tray = new Tray(trayIcon);
     const contextMenu = Menu.buildFromTemplate([
         {
             label: 'Open',
             type: 'normal',
             click: function () {
-                BrowserWindow.getAllWindows().forEach(function (win) {
-                    win.show();
-                });
+                mainWindow.show();
             }
         },
         {
             label: 'DevTools',
             type: 'normal',
             click: function () {
-                BrowserWindow.getAllWindows().forEach(function (win) {
-                    win.webContents.openDevTools();
-                });
+                mainWindow.webContents.openDevTools();
             }
         },
         {
             label: 'Quit VRCX',
             type: 'normal',
             click: function () {
-                app.isQuitting = true;
+                appIsQuitting = true;
                 app.quit();
             }
         }
@@ -288,40 +532,13 @@ function createTray() {
     tray.setContextMenu(contextMenu);
 
     tray.on('click', () => {
-        BrowserWindow.getAllWindows().forEach(function (win) {
-            win.show();
-        });
+        mainWindow.show();
     });
 }
 
-/*
-async function installVRCXappImageLauncher() {
-    const iconUrl =
-    'https://raw.githubusercontent.com/vrcx-team/VRCX/master/VRCX.png';
-
-    let targetIconName;
-    const desktopFiles = fs.readdirSync(
-        path.join(homePath, '.local/share/applications')
-    );
-    for (const file of desktopFiles) {
-        if (file.includes('appimagekit_') && file.includes('VRCX')) {
-            console.log('AppImageLauncher shortcut found:', file);
-            targetIconName = file.replace('.desktop', '.png');
-            targetIconName = targetIconName.replace('-', '_');
-            try {
-            } catch (err) {
-                console.error('Error deleting shortcut:', err);
-                return;
-            }
-        }
-    }
-
-    const iconPath = '~/.local/share/icons/' + targetIconName;
-    const expandedPath = iconPath.replace('~', process.env.HOME);
-    const targetIconPath = path.join(expandedPath);    
-    await downloadIcon(iconUrl, targetIconPath);
+function setTrayIconNotification(notify) {
+    tray.setImage(notify ? trayIconNotify : trayIcon);
 }
-*/
 
 async function installVRCX() {
     console.log('Home path:', homePath);
@@ -331,121 +548,161 @@ async function installVRCX() {
         return;
     }
     if (noInstall) {
+        interopApi.getDotNetObject('Update').Init(appImagePath);
         console.log('Skipping installation.');
         return;
     }
 
-    /*
-    let appImageLauncherInstalled = false;
-    if (fs.existsSync('/usr/bin/AppImageLauncher')) {
-        appImageLauncherInstalled = true;
-    }
-    */
-
-    if (appImagePath.startsWith(path.join(homePath, 'Applications'))) {
-        /*
-        if (appImageLauncherInstalled) {
-            installVRCXappImageLauncher();
-        }
-        */
-        interopApi.getDotNetObject('Update').Init(appImagePath);
-        console.log('VRCX is already installed.');
-        return;
-    }
-
-    let currentName = path.basename(appImagePath);
-    let newName = 'VRCX.AppImage';
-    if (currentName !== newName) {
-        const newPath = path.join(path.dirname(appImagePath), newName);
+    // rename AppImage to VRCX.AppImage
+    const currentName = path.basename(appImagePath);
+    const expectedName = 'VRCX.AppImage';
+    if (currentName !== expectedName) {
+        const newPath = path.join(path.dirname(appImagePath), expectedName);
         try {
+            // remove existing VRCX.AppImage
+            if (fs.existsSync(newPath)) {
+                fs.unlinkSync(newPath);
+            }
             fs.renameSync(appImagePath, newPath);
             console.log('AppImage renamed to:', newPath);
             appImagePath = newPath;
         } catch (err) {
-            console.error('Error renaming AppImage:', err);
-            dialog.showErrorBox('VRCX', 'Failed to rename AppImage.');
+            console.error(`Error renaming AppImage ${newPath}`, err);
+            dialog.showErrorBox('VRCX', `Failed to rename AppImage ${newPath}`);
             return;
         }
     }
 
-    if (
-        process.env.APPIMAGE.startsWith(path.join(homePath, 'Applications')) &&
-        path.basename(process.env.APPIMAGE) === 'VRCX.AppImage'
-    ) {
-        interopApi.getDotNetObject('Update').Init(appImagePath);
-        console.log('VRCX is already installed.');
-        return;
-    }
-
-    const targetPath = path.join(homePath, 'Applications');
-    console.log('Target Path:', targetPath);
-
-    // Create target directory if it doesn't exist
-    if (!fs.existsSync(targetPath)) {
-        fs.mkdirSync(targetPath);
-    }
-
-    const targetAppImagePath = path.join(targetPath, 'VRCX.AppImage');
-
-    // Move the AppImage to the target directory
-    try {
-        if (fs.existsSync(targetAppImagePath)) {
-            fs.unlinkSync(targetAppImagePath);
+    // ask to move AppImage to ~/Applications
+    const appImageHomePath = `${homePath}/Applications/VRCX.AppImage`;
+    if (!hasAskedToMoveAppImage && appImagePath !== appImageHomePath) {
+        const result = dialog.showMessageBoxSync(mainWindow, {
+            type: 'question',
+            title: 'VRCX',
+            message: 'Do you want to install VRCX?',
+            detail: 'VRCX will be moved to your ~/Applications folder.',
+            buttons: ['No', 'Yes']
+        });
+        if (result === 0) {
+            console.log('Cancel AppImage move to ~/Applications');
+            // don't ask again
+            VRCXStorage.Set('VRCX_HasAskedToMoveAppImage', 'true');
+            VRCXStorage.Save();
         }
-        fs.renameSync(appImagePath, targetAppImagePath);
-        appImagePath = targetAppImagePath;
-        console.log('AppImage moved to:', targetAppImagePath);
-    } catch (err) {
-        console.error('Error moving AppImage:', err);
-        dialog.showErrorBox('VRCX', 'Failed to move AppImage.');
-        return;
+        if (result === 1) {
+            console.log('Moving AppImage to ~/Applications');
+            try {
+                const applicationsPath = path.join(homePath, 'Applications');
+                // create ~/Applications if it doesn't exist
+                if (!fs.existsSync(applicationsPath)) {
+                    fs.mkdirSync(applicationsPath);
+                }
+                // remove existing VRCX.AppImage
+                if (fs.existsSync(appImageHomePath)) {
+                    fs.unlinkSync(appImageHomePath);
+                }
+                fs.renameSync(appImagePath, appImageHomePath);
+                appImagePath = appImageHomePath;
+                console.log('AppImage moved to:', appImageHomePath);
+            } catch (err) {
+                console.error(`Error moving AppImage ${appImageHomePath}`, err);
+                dialog.showErrorBox(
+                    'VRCX',
+                    `Failed to move AppImage ${appImageHomePath}`
+                );
+                return;
+            }
+        }
     }
+
+    // inform .NET side about AppImage path
+    interopApi.getDotNetObject('Update').Init(appImagePath);
 
     await createDesktopFile();
-    dialog.showMessageBox({
-        type: 'info',
-        title: 'VRCX',
-        message: 'VRCX has been installed successfully.',
-        detail: 'You can now find VRCX in your ~/Applications folder.'
-    });
 }
 
 async function createDesktopFile() {
-    // Download the icon and save it to the target directory
-    const iconUrl =
-        'https://raw.githubusercontent.com/vrcx-team/VRCX/master/VRCX.png';
-    const iconPath = path.join(homePath, '.local/share/icons/VRCX.png');
-    await downloadIcon(iconUrl, iconPath)
-        .then(() => {
-            console.log('Icon downloaded and saved to:', iconPath);
-            const desktopFile = `[Desktop Entry]
-Name=VRCX
-Comment=Friendship management tool for VRChat
-Exec=${appImagePath} --ozone-platform-hint=auto
-Icon=VRCX
-Type=Application
-Categories=Network;InstantMessaging;Game;
-Terminal=false
-StartupWMClass=VRCX
-`;
+    if (noDesktop) {
+        console.log('Skipping desktop file creation.');
+        return;
+    }
 
-            const desktopFilePath = path.join(
-                homePath,
-                '.local/share/applications/VRCX.desktop'
+    // Download the icon and save it to the target directory
+    const iconPath = path.join(homePath, '.local/share/icons/VRCX.png');
+    if (!fs.existsSync(iconPath) || fs.statSync(iconPath).size === 0) {
+        const iconDir = path.dirname(iconPath);
+        if (!fs.existsSync(iconDir)) {
+            fs.mkdirSync(iconDir, { recursive: true });
+        }
+        const iconUrl =
+            'https://raw.githubusercontent.com/vrcx-team/VRCX/master/images/VRCX.png';
+        await downloadIcon(iconUrl, iconPath)
+            .then(() => {
+                console.log('Icon downloaded and saved to:', iconPath);
+            })
+            .catch((err) => {
+                console.error('Error downloading icon:', err);
+                dialog.showErrorBox('VRCX', 'Failed to download the icon.');
+            });
+    }
+
+    // Create the desktop file
+    const desktopFilePath = path.join(
+        homePath,
+        '.local/share/applications/VRCX.desktop'
+    );
+
+    const dotDesktop = {
+        Name: 'VRCX',
+        Version: version,
+        Comment: 'Friendship management tool for VRChat',
+        Exec: `${appImagePath} --ozone-platform-hint=auto %U`,
+        Icon: 'VRCX',
+        Type: 'Application',
+        Categories: 'Network;InstantMessaging;Game;',
+        Terminal: 'false',
+        StartupWMClass: 'VRCX',
+        MimeType: 'x-scheme-handler/vrcx;'
+    };
+    const desktopFile =
+        '[Desktop Entry]\n' +
+        Object.entries(dotDesktop)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('\n');
+    try {
+        // Create the applications directory if it doesn't exist
+        const desktopDir = path.dirname(desktopFilePath);
+        if (!fs.existsSync(desktopDir)) {
+            fs.mkdirSync(desktopDir, { recursive: true });
+        }
+
+        // Create/update the desktop file when needed
+        let existingDesktopFile = '';
+        if (fs.existsSync(desktopFilePath)) {
+            existingDesktopFile = fs.readFileSync(desktopFilePath, 'utf8');
+        }
+        if (existingDesktopFile !== desktopFile) {
+            fs.writeFileSync(desktopFilePath, desktopFile);
+            console.log('Desktop file created at:', desktopFilePath);
+
+            const result = spawnSync(
+                'xdg-mime',
+                ['default', 'VRCX.desktop', 'x-scheme-handler/vrcx'],
+                {
+                    encoding: 'utf-8'
+                }
             );
-            try {
-                fs.writeFileSync(desktopFilePath, desktopFile);
-                console.log('Desktop file created at:', desktopFilePath);
-            } catch (err) {
-                console.error('Error creating desktop file:', err);
-                dialog.showErrorBox('VRCX', 'Failed to create desktop entry.');
-                return;
+            if (result.error) {
+                console.error('Error setting MIME type:', result.error);
+            } else {
+                console.log('MIME type set x-scheme-handler/vrcx');
             }
-        })
-        .catch((err) => {
-            console.error('Error downloading icon:', err);
-            dialog.showErrorBox('VRCX', 'Failed to download the icon.');
-        });
+        }
+    } catch (err) {
+        console.error('Error creating desktop file:', err);
+        dialog.showErrorBox('VRCX', 'Failed to create desktop entry.');
+        return;
+    }
 }
 
 function downloadIcon(url, targetPath) {
@@ -472,15 +729,38 @@ function downloadIcon(url, targetPath) {
     });
 }
 
+function getElectronUserDataPath() {
+    const electronUserData = 'ElectronUserData';
+    if (process.platform === 'win32') {
+        return path.join(getVRCXPath(), electronUserData);
+    }
+    if (process.platform === 'darwin') {
+        return path.join(
+            process.env.HOME,
+            'Library/Caches/VRCX',
+            electronUserData
+        );
+    }
+    // Linux or other
+    let cacheHome = process.env.XDG_CACHE_HOME;
+    if (!cacheHome) {
+        cacheHome = path.join(process.env.HOME, '.cache');
+    }
+    return path.join(cacheHome, 'VRCX', electronUserData);
+}
+
 function getVRCXPath() {
     if (process.platform === 'win32') {
         return path.join(process.env.APPDATA, 'VRCX');
-    } else if (process.platform === 'linux') {
-        return path.join(process.env.HOME, '.config/VRCX');
     } else if (process.platform === 'darwin') {
         return path.join(process.env.HOME, 'Library/Application Support/VRCX');
     }
-    return '';
+    // Linux or other
+    let configHome = process.env.XDG_CONFIG_HOME;
+    if (!configHome) {
+        configHome = path.join(process.env.HOME, '.config');
+    }
+    return path.join(configHome, 'VRCX');
 }
 
 function getHomePath() {
@@ -489,32 +769,55 @@ function getHomePath() {
         const absoluteHomePath = fs.realpathSync(relativeHomePath);
         return absoluteHomePath;
     } catch (err) {
+        console.error('Error resolving absolute home path:', err);
         return relativeHomePath;
     }
 }
 
 function getVersion() {
-    let version = 'VRCX (Linux) Build';
     try {
-        version = `VRCX (Linux) ${fs.readFileSync(path.join(rootDir, 'Version'), 'utf8').trim()}`;
+        const versionFile = fs
+            .readFileSync(path.join(rootDir, 'Version'), 'utf8')
+            .trim();
+
+        // look for trailing git hash "-22bcd96" to indicate nightly build
+        const version = versionFile.split('-');
+        console.log('Version:', versionFile);
+        if (version.length > 0 && version[version.length - 1].length == 7) {
+            return `VRCX (Linux) Nightly ${versionFile}`;
+        } else {
+            return `VRCX (Linux) ${versionFile}`;
+        }
     } catch (err) {
         console.error('Error reading Version:', err);
+        return 'VRCX (Linux) Nightly Build';
     }
-    return version;
 }
 
 function isDotNetInstalled() {
-    if (process.platform === 'darwin') {
-        // Assume .NET is already installed on macOS
-        return true;
-    }
-    const result = require('child_process').spawnSync(
-        'dotnet',
-        ['--list-runtimes'],
-        {
-            encoding: 'utf-8'
+    let dotnetPath;
+
+    if (process.env.DOTNET_ROOT) {
+        dotnetPath = path.join(process.env.DOTNET_ROOT, 'dotnet');
+        if (!fs.existsSync(dotnetPath)) {
+            // fallback to command
+            dotnetPath = 'dotnet';
         }
-    );
+    } else {
+        // fallback to command
+        dotnetPath = 'dotnet';
+    }
+
+    console.log('Checking for .NET installation at:', dotnetPath);
+
+    // Fallback to system .NET runtime
+    const result = spawnSync(dotnetPath, ['--list-runtimes'], {
+        encoding: 'utf-8'
+    });
+    if (result.error) {
+        console.error('Error checking .NET runtimes:', result.error);
+        return false;
+    }
     return result.stdout?.includes('.NETCore.App 9.0');
 }
 
@@ -553,8 +856,8 @@ function tryCopyFromWinePrefix() {
 }
 
 function applyWindowState() {
-    if (VRCXStorage.Get('VRCX_StartAsMinimizedState') === 'true') {
-        if (isCloseToTray) {
+    if (VRCXStorage.Get('VRCX_StartAsMinimizedState') === 'true' && startup) {
+        if (getCloseToTray()) {
             mainWindow.hide();
             return;
         }
@@ -579,20 +882,45 @@ function applyWindowState() {
 
 app.whenReady().then(() => {
     createWindow();
-
     createTray();
-
     installVRCX();
 
     app.on('activate', function () {
-        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+        if (BrowserWindow.getAllWindows().length === 0) {
+            createWindow();
+        } else {
+            // Ensure main window shows when clicking Dock icon (critical for macOS)
+            if (mainWindow && !mainWindow.isVisible()) {
+                mainWindow.show();
+            }
+        }
     });
 });
 
-// app.on('before-quit', function () {
-//    mainWindow.webContents.send('windowClosed');
-// });
+function disposeOverlay() {
+    if (!isOverlayActive) {
+        return;
+    }
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.close();
+    }
+    overlayWindow = undefined;
+    isOverlayActive = false;
+    if (fs.existsSync(OVERLAY_SHM_PATH)) {
+        fs.unlinkSync(OVERLAY_SHM_PATH);
+    }
+}
+
+app.on('before-quit', function () {
+    // Mark it as a quitting state to make macOS Dock's "Quit" action take effect.
+    appIsQuitting = true;
+    disposeOverlay();
+});
 
 app.on('window-all-closed', function () {
-    if (process.platform !== 'darwin') app.quit();
+    disposeOverlay();
+
+    if (process.platform !== 'darwin') {
+        app.quit();
+    }
 });

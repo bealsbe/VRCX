@@ -1,9 +1,3 @@
-// Copyright(c) 2019-2025 pypy, Natsumi and individual contributors.
-// All rights reserved.
-//
-// This work is licensed under the terms of the MIT license.
-// For a copy, see <https://opensource.org/licenses/MIT>.
-
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -28,16 +22,14 @@ namespace VRCX
 
         public string GetAssetId(string id, string variant = "")
         {
-            using (var sha256 = SHA256.Create())
+            using var sha256 = SHA256.Create();
+            var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(id + variant));
+            var idHex = new StringBuilder(hash.Length * 2);
+            foreach (var b in hash)
             {
-                byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(id + variant));
-                StringBuilder idHex = new StringBuilder(hash.Length * 2);
-                foreach (byte b in hash)
-                {
-                    idHex.AppendFormat("{0:x2}", b);
-                }
-                return idHex.ToString().ToUpper().Substring(0, 16);
+                idHex.Append($"{b:x2}");
             }
+            return idHex.ToString().ToUpper().Substring(0, 16);
         }
 
         public string GetAssetVersion(int version, int variantVersion = 0)
@@ -107,7 +99,7 @@ namespace VRCX
             var versionLocation = GetAssetVersion(version, variantVersion);
             if (!Directory.Exists(topDir))
                 return Path.Join(topDir, versionLocation);
-            var versionSearchPattern = string.Concat("*", versionLocation.AsSpan(8));
+            var versionSearchPattern = string.Concat("*", versionLocation.AsSpan(16));
             var dirs = Directory.GetDirectories(topDir, versionSearchPattern);
             if (dirs.Length > 0)
                 return dirs.OrderByDescending(dir => ReverseHexToDecimal(Path.GetFileName(dir)).Item2).First();
@@ -136,7 +128,7 @@ namespace VRCX
             if (File.Exists(fileLocation))
             {
                 cachePath = fullLocation;
-                FileInfo data = new FileInfo(fileLocation);
+                var data = new FileInfo(fileLocation);
                 fileSize = data.Length;
             }
             if (File.Exists(Path.Join(fullLocation, "__lock")))
@@ -241,8 +233,8 @@ namespace VRCX
         public long DirSize(DirectoryInfo d)
         {
             long size = 0;
-            FileInfo[] files = d.GetFiles("*.*", SearchOption.AllDirectories);
-            foreach (FileInfo file in files)
+            var files = d.GetFiles("*.*", SearchOption.AllDirectories);
+            foreach (var file in files)
             {
                 size += file.Length;
             }

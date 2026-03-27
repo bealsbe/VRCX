@@ -88,20 +88,25 @@ namespace VRCX
         /// <param name="title">The title of the notification.</param>
         /// <param name="body">The content of the notification.</param>
         /// <param name="timeout">[CURRENTLY UNUSED]The timeout of the notification.</param>
+        /// <param name="opacity">The opacity of the notification (0.0 to 1.0).</param>
         /// <param name="image">The image of the notification.</param>
-        public void OVRTNotification(bool hudNotification, bool wristNotification, string title, string body, int timeout, string image = "")
+        public void OVRTNotification(bool hudNotification, bool wristNotification, string title, string body, int timeout, double opacity, string image = "")
         {
             List<OvrtMessage> messages = [];
 
-            byte[] imageBytes;
-            if(!string.IsNullOrWhiteSpace(image) && File.Exists(image))
+            byte[] imageBytes = null;
+            try
             {
-                imageBytes = File.ReadAllBytes(image);
+                if (!string.IsNullOrWhiteSpace(image) && File.Exists(image))
+                {
+                    imageBytes = File.ReadAllBytes(image);
+                }
             }
-            else
+            catch (Exception ex)
             {
-                imageBytes = _vrcxIcon;
+                logger.Error(ex, "Failed to read OVRT notification image");
             }
+            imageBytes ??= _vrcxIcon;
 
             if (wristNotification)
             {

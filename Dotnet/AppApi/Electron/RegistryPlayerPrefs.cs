@@ -45,7 +45,7 @@ namespace VRCX
         {
             var compatToolMapping = new Dictionary<string, string>();
             const string sectionHeader = "\"CompatToolMapping\"";
-            int sectionStart = vdfContent.IndexOf(sectionHeader);
+            int sectionStart = vdfContent.IndexOf(sectionHeader, StringComparison.Ordinal);
 
             if (sectionStart == -1)
             {
@@ -53,7 +53,7 @@ namespace VRCX
                 return compatToolMapping;
             }
 
-            int blockStart = vdfContent.IndexOf("{", sectionStart) + 1;
+            int blockStart = vdfContent.IndexOf('{', sectionStart) + 1;
             int blockEnd = FindMatchingBracket(vdfContent, blockStart - 1);
 
             if (blockStart == -1 || blockEnd == -1)
@@ -317,6 +317,12 @@ namespace VRCX
         {
             string winePath = GetVRChatWinePath();
             string winePrefix = _vrcPrefixPath;
+            if (string.IsNullOrEmpty(winePath) || string.IsNullOrEmpty(winePrefix))
+            {
+                logger.Info("VRC Wine path was not found");
+                return null;
+            }
+            
             string wineRegCommand = $"\"{winePath}\" reg {command}";
             ProcessStartInfo processStartInfo = GetWineProcessStartInfo(winePath, winePrefix, wineRegCommand);
             using var process = Process.Start(processStartInfo);
@@ -605,10 +611,10 @@ namespace VRCX
         public string GetVRChatRegistryJson()
         {
             var registry = new Dictionary<string, Dictionary<string, object>>();
-            string regCommand = "query \"HKEY_CURRENT_USER\\SOFTWARE\\VRChat\\VRChat\"";
+            const string regCommand = "query \"HKEY_CURRENT_USER\\SOFTWARE\\VRChat\\VRChat\"";
             var queryResult = GetWineRegCommand(regCommand);
             if (queryResult == null)
-                return null;
+                throw new Exception("Failed to get VRC registry data");
 
             var lines = queryResult.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
                 .Where(line => 

@@ -19,7 +19,14 @@ contextBridge.exposeInMainWorld('interopApi', {
     }
 });
 
+const validChannels = ['launch-command'];
+
 contextBridge.exposeInMainWorld('electron', {
+    getArch: () => ipcRenderer.invoke('app:getArch'),
+    getClipboardText: () => ipcRenderer.invoke('app:getClipboardText'),
+    getNoUpdater: () => ipcRenderer.invoke('app:getNoUpdater'),
+    setTrayIconNotification: (notify) =>
+        ipcRenderer.invoke('app:setTrayIconNotification', notify),
     openFileDialog: () => ipcRenderer.invoke('dialog:openFile'),
     openDirectoryDialog: () => ipcRenderer.invoke('dialog:openDirectory'),
     onWindowPositionChanged: (callback) =>
@@ -28,7 +35,25 @@ contextBridge.exposeInMainWorld('electron', {
         ipcRenderer.on('setWindowSize', callback),
     onWindowStateChange: (callback) =>
         ipcRenderer.on('setWindowState', callback),
+    onBrowserFocus: (callback) => ipcRenderer.on('onBrowserFocus', callback),
     desktopNotification: (title, body, icon) =>
         ipcRenderer.invoke('notification:showNotification', title, body, icon),
-    restartApp: () => ipcRenderer.invoke('app:restart')
+    restartApp: () => ipcRenderer.invoke('app:restart'),
+    getOverlayWindow: () => ipcRenderer.invoke('app:getOverlayWindow'),
+    updateVr: (active, hmdOverlay, wristOverlay, menuButton, overlayHand) =>
+        ipcRenderer.invoke(
+            'app:updateVr',
+            active,
+            hmdOverlay,
+            wristOverlay,
+            menuButton,
+            overlayHand
+        ),
+    ipcRenderer: {
+        on(channel, func) {
+            if (validChannels.includes(channel)) {
+                ipcRenderer.on(channel, (event, ...args) => func(...args));
+            }
+        }
+    }
 });
